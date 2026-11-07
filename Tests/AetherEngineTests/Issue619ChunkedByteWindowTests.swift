@@ -92,6 +92,21 @@ struct Issue619ChunkedByteWindowTests {
         #expect(bytes(window) == [UInt8](backing[10..<20] + backing[40..<44]))
     }
 
+    @Test("append takes ownership of delivered storage rather than pinning the transport")
+    func appendCopiesTransportStorage() {
+        // Heap storage (not Data's inline small-value buffer) keeps the pointer check valid.
+        let delivered = Data(repeating: 0xA5, count: 64 * 1024)
+        let deliveryAddress = delivered.withUnsafeBytes { UnsafeRawPointer($0.baseAddress) }
+        var window = ChunkedByteWindow()
+        window.append(delivered)
+        #if DEBUG
+        #expect(window.chunkStorageAddresses().count == 1)
+        #expect(window.chunkStorageAddresses()[0] != deliveryAddress)
+        #endif
+        #expect(window.count == delivered.count)
+        #expect(window.prefix(delivered.count) == [UInt8](delivered))
+    }
+
     /// The reader's own mix, many times over: append what arrives, read near the head, drop the
     /// consumed head, and now and then cut the tail for a reconnect. Checked against a contiguous
     /// `Data` doing the same thing the old way.
