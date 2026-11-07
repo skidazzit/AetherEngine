@@ -26,9 +26,8 @@ enum MallocBlockCensus {
     /// Diagnostic opt-in. Set once during host start-up, read from the memprobe tick.
     nonisolated(unsafe) static var isEnabled = false
 
-    /// Buckets are powers of two; anything below this is aggregated away because the
-    /// interesting signal is a handful of multi-megabyte blocks, not the small-object churn
-    /// the block count already covers.
+    /// Big-block buckets start here. Smaller blocks are captured in seven coarse bins
+    /// when the census is enabled, so the dominant small-heap range is visible too.
     static let minimumTrackedBytes = 1 << 20   // 1 MB
 
     /// Highest bucket, i.e. blocks >= 2^40. Sized so the index arithmetic cannot run off the
@@ -40,6 +39,12 @@ enum MallocBlockCensus {
     /// exactly 64 MiB names a watermark; an arbitrary size does not).
     static let topExactCount = 6
 
+    /// Debug census bins below 1 MiB. These expose the small-block heap that a
+    /// large-block-only census cannot explain on 4K Dolby Vision sessions.
+    static let smallBucketCount = 7
+    static let smallBucketLabels = ["<64B", "64-255B", "256B-1KB", "1-4KB",
+                                    "4-16KB", "16-64KB", "64KB-1MB"]
+
     struct Result {
         /// Live blocks at or above `minimumTrackedBytes`.
         var count: Int
@@ -49,9 +54,11 @@ enum MallocBlockCensus {
         var buckets: [(bytes: Int, count: Int)]
         /// Exact sizes of the largest individual blocks, descending.
         var largest: [Int]
+        /// (size range, live count, total bytes), sorted by size range.
+        var smallBuckets: [(label: String, count: Int, bytes: Int)]
     }
 
-    /// Walk every malloc zone and tally live blocks >= `minimumTrackedBytes`.
+    /// Walk every malloc zone and tally live blocks by size range.
     /// Returns nil when disabled or when the zone list cannot be read.
     static func census() -> Result? {
         guard isEnabled else { return nil }
@@ -64,7 +71,8 @@ enum MallocBlockCensus {
 
         // Reserved BEFORE any zone lock is taken: bucket counts, then bucket bytes, then the
         // running top-N exact sizes.
-        let slotCount = bucketCount * 2 + topExactCount
+        let smallStart = bucketCount * 2 + topExactCount
+        let slotCount = smallStart + smallBucketCount * 2
         let slots = UnsafeMutablePointer<Int>.allocate(capacity: slotCount)
         slots.initialize(repeating: 0, count: slotCount)
         defer { slots.deallocate() }
@@ -98,7 +106,13 @@ enum MallocBlockCensus {
         for i in 0..<topExactCount where slots[bucketCount * 2 + i] > 0 {
             largest.append(slots[bucketCount * 2 + i])
         }
-        return Result(count: total, bytes: totalBytes, buckets: buckets, largest: largest)
+        var smallBuckets: [(label: String, count: Int, bytes: Int)] = []
+        for i in 0..<smallBucketCount where slots[smallStart + i] > 0 {
+            smallBuckets.append((smallBucketLabels[i], slots[smallStart + i],
+                                 slots[smallStart + smallBucketCount + i]))
+        }
+        return Result(count: total, bytes: totalBytes, buckets: buckets,
+                      largest: largest, smallBuckets: smallBuckets)
     }
 
     /// AE#445: the growth POLICY of the largest block, which names the allocator family holding it.
@@ -176,9 +190,12 @@ enum MallocBlockCensus {
             .map { "\($0.bytes / (1 << 20))MBx\($0.count)" }
             .joined(separator: ",")
         let exact = result.largest.map { String($0) }.joined(separator: ",")
+        let small = result.smallBuckets.sorted { $0.bytes > $1.bytes }.prefix(4)
+            .map { "\($0.label):\($0.bytes / (1 << 20))MB/\($0.count)" }.joined(separator: ",")
         return "bigBlocks=\(result.count) bigMB=\(result.bytes / (1 << 20)) "
             + "bigTop=\(top.isEmpty ? "none" : top) "
             + "bigExact=\(exact.isEmpty ? "none" : exact) "
+            + "smallTop=\(small.isEmpty ? "none" : small) "
             + memprobeGrowth.fragment(largest: result.largest.first ?? 0)
     }
 }
@@ -220,7 +237,21 @@ private func aeCensusRecord(
     while i < n {
         let size = Int(ranges[i].size)
         i += 1
-        if size < MallocBlockCensus.minimumTrackedBytes { continue }
+        if size < MallocBlockCensus.minimumTrackedBytes {
+            // Fixed bins and integer-only work. Never allocate while the malloc zone is locked.
+            let bucket: Int
+            if size < 64 { bucket = 0 }
+            else if size < 256 { bucket = 1 }
+            else if size < 1024 { bucket = 2 }
+            else if size < 4096 { bucket = 3 }
+            else if size < 16384 { bucket = 4 }
+            else if size < 65536 { bucket = 5 }
+            else { bucket = 6 }
+            let start = MallocBlockCensus.bucketCount * 2 + MallocBlockCensus.topExactCount
+            slots[start + bucket] += 1
+            slots[start + MallocBlockCensus.smallBucketCount + bucket] += size
+            continue
+        }
         // Bucket by floor(log2(size)), clamped into the scratch buffer.
         var bucket = 0
         var probe = size
