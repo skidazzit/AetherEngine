@@ -1,6 +1,6 @@
 import Foundation
 
-/// AE#619: the persistent reader's byte window, held as the chunks the connection delivered.
+/// AE#619: the persistent reader's byte window, held as independently owned chunks.
 ///
 /// The reader used to keep one contiguous `Data` and drop its consumed head with `subdata(in:)`,
 /// which copied everything still ahead of the cut: up to ~18 MB once per 4 MB consumed, several
@@ -26,7 +26,14 @@ struct ChunkedByteWindow {
 
     mutating func append(_ data: Data) {
         guard !data.isEmpty else { return }
-        chunks.append(data)
+        // URLSession delivery Data may share a larger dispatch_data allocation. Retaining
+        // the value through Data's CoW keeps that transport storage alive after the callback,
+        // even when the logical window is only a few MB. Always own the exact delivered bytes.
+        // Data(data) and Data.append(data) do not guarantee this ownership boundary.
+        let owned = data.withUnsafeBytes { bytes -> Data in
+            Data(bytes: bytes.baseAddress!, count: bytes.count)
+        }
+        chunks.append(owned)
         tail += data.count
         ends.append(tail)
     }
